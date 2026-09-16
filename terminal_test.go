@@ -348,6 +348,42 @@ func TestRenderFrame_OverwritesPreviousFrame(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// RenderFrame: stale-pixel regression (clear before draw)
+// ---------------------------------------------------------------------------
+
+func TestRenderFrame_ClearsBeforeDraw(t *testing.T) {
+	term, sim := newTestTerminal(t, 40, 20)
+	defer term.Close()
+
+	// Render a wide frame that fills many cells.
+	wideFrame := []string{
+		"AAAAAAAAAAAAAAAAAAAAAAAA", // 24 chars wide
+		"BBBBBBBBBBBBBBBBBBBBBBBB",
+		"CCCCCCCCCCCCCCCCCCCCCCCC",
+	}
+	term.RenderFrame(wideFrame)
+
+	// Now render a narrow frame (1x1).
+	narrowFrame := []string{"X"}
+	term.RenderFrame(narrowFrame)
+
+	// Verify no ghost pixels from the wide frame remain.
+	// The narrow frame 'X' is at center (19,9). All other cells must be ' '.
+	grid := getScreenContent(t, sim, 40, 20)
+	for y := 0; y < 20; y++ {
+		for x := 0; x < 40; x++ {
+			expected := ' '
+			if x == 19 && y == 9 {
+				expected = 'X'
+			}
+			if grid[y][x] != expected {
+				t.Errorf("cell(%d,%d) = %q, want %q (ghost pixel from wide frame)", x, y, grid[y][x], expected)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // PollEvent: simulation injection
 // ---------------------------------------------------------------------------
 
@@ -415,6 +451,9 @@ func makeEmptyGrid(w, h int) [][]rune {
 	grid := make([][]rune, h)
 	for y := range grid {
 		grid[y] = make([]rune, w)
+		for x := range grid[y] {
+			grid[y][x] = ' '
+		}
 	}
 	return grid
 }

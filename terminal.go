@@ -56,6 +56,10 @@ func (t *Terminal) RenderFrame(frame []string) {
 		return
 	}
 
+	// Clear screen before drawing non-empty frame to prevent ghost artifacts
+	// when switching between frames of different sizes.
+	t.screen.Clear()
+
 	// Find the widest line in the frame.
 	frameW := 0
 	for _, line := range frame {

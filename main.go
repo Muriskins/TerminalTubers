@@ -43,8 +43,16 @@ func main() {
 		defer capture.Close()
 	}
 
+	// Create the avatar from the loaded frames. The first frame is the idle
+	// pose; the remaining three are the talking frames.
+	avatar, err := NewAvatar(frames)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "TerminalTubers: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Render the idle frame once to start.
-	term.RenderFrame(frames[0])
+	avatar.Render(term, frames[0])
 
 	// Event loop: wait for q/Q to quit, or resize to re-render.
 	for {
@@ -57,7 +65,7 @@ func main() {
 			}
 		case *tcell.EventResize:
 			term.screen.Sync()
-			term.RenderFrame(frames[0])
+			term.RenderFrame(avatar.CurrentFrame())
 		}
 
 		// Surface mid-session capture failures (FR-026): return to the idle
