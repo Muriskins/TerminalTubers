@@ -33,6 +33,7 @@ Go appends `-mthreads` to the compiler line for windows cgo builds; clang (MSVC 
 - Animation tests (`animation_test.go`, 76 tests) drive `AnimateTransition` and the Smart helpers on `tcell.NewSimulationScreen` — 100% coverage of `animation.go`.
 - `TestNewCapture_GracefulDegradation` exercises real malgo init and may hang in sandboxes without an audio backend — run it separately with a short `-timeout` if it hangs.
 - Audio tests drive the production `dataCallback` with synthetic little-endian float32 buffers.
+- State-machine tests (`state_machine_test.go`, 18 tests) drive `Tick` with synthetic voice/time sequences — 100% branch coverage of `state_machine.go`.
 
 ## Frames (go:embed)
 
@@ -40,8 +41,9 @@ Four ASCII frames are embedded: `ascii_art/idle.txt` + `tolk0/1/2.txt`. Adding a
 
 ## Gotchas
 
-- README.md documents Phases 1–3 (terminal layer, audio capture via malgo, avatar rendering + transition animations; CGO required). Keep it in sync with the code as later phases land.
-- Current behavior: idle avatar + background audio capture; `PlayAnimation`/`AnimateTransition` implement the full animation system (Scramble/Collapse/Reveal/Smart), but RMS is not yet wired to frame switching — the state machine is Phase 4.
+- README.md documents Phases 1–4 (terminal layer, audio capture via malgo, avatar rendering + transition animations, main loop + idle/talking state machine; CGO required). Keep it in sync with the code as later phases land.
+- Current behavior: the avatar reacts to voice — 3 consecutive voiced 50ms ticks (~150ms) switch idle→talking with a random talking frame (chosen once per transition); 500ms of silence returns to idle. The state machine is a pure, testable type in `state_machine.go`; `main.go` only wires it to the ticker, capture RMS, and avatar.
+- Main loop: `PollEvent` blocks, so it is drained in a goroutine into a buffered channel (cap 8); the goroutine exits when PollEvent returns nil after terminal close. A 50ms ticker drives the state machine; q/Q/Escape quit, s/S is reserved for the Phase 5 settings menu (recognized but a no-op).
 - Animation quirks: `AnimateTransition` clamps steps to [1,50] and delay to [1,500]ms (deliberate deviation from Rust, which does not clamp); Smart mode clamps steps to min 8 and Instant-mode delay to min 50ms; Collapse uses hardcoded `collapseChars`, NOT the configured charset; unknown styles render instantly.
 - Build artifacts: `TerminalTubers.exe` is gitignored; `clang-wrap.exe` and `cover` are not (known repo-hygiene issue).
 - Commit policy: commit AND push after each completed task (user decision).
