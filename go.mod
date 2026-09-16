@@ -2,7 +2,10 @@ module github.com/Muriskins/TerminalTubers
 
 go 1.26.5
 
-require github.com/gdamore/tcell/v2 v2.13.10
+require (
+	github.com/gdamore/tcell/v2 v2.13.10
+	github.com/gen2brain/malgo v0.11.26
+)
 
 require (
 	github.com/gdamore/encoding v1.0.1 // indirect
