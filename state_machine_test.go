@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math/rand"
 	"testing"
 	"time"
 )
@@ -416,5 +417,70 @@ func TestStateMachine_IdleDelayExactBoundary_MultipleExtensions(t *testing.T) {
 	// Silence at start+1101ms: 501ms since lastVoice — return to idle.
 	if got := sm.Tick(false, start.Add(1101*time.Millisecond)); got != ActionReturnToIdle {
 		t.Errorf("Tick 501ms after last extend = %v, want ActionReturnToIdle", got)
+	}
+}
+
+// --- pickTalkingFrame tests ---
+
+func TestPickTalkingFrame_CoversAllTalkingFramesOver30Calls(t *testing.T) {
+	// SC-011: over >=30 calls with a seeded rand, every talking frame must
+	// appear at least once. Uses a 4-frame fixture (1 idle + 3 talking,
+	// matching the real asset layout).
+	frames := [][]string{
+		{"idle"},
+		{"talk1"},
+		{"talk2"},
+		{"talk3"},
+	}
+
+	seen := make(map[string]bool)
+	const calls = 30
+	rng := rand.New(rand.NewSource(42))
+
+	for i := 0; i < calls; i++ {
+		got := pickTalkingFrame(frames, rng)
+		// Must never return the idle frame (index 0).
+		if got[0] == "idle" {
+			t.Fatalf("pickTalkingFrame returned idle frame on call %d", i+1)
+		}
+		seen[got[0]] = true
+	}
+
+	// All 3 talking frames must have been observed.
+	for _, expected := range []string{"talk1", "talk2", "talk3"} {
+		if !seen[expected] {
+			t.Errorf("talking frame %q was never selected in %d calls (SC-011)", expected, calls)
+		}
+	}
+}
+
+func TestPickTalkingFrame_NeverReturnsIdleFrame(t *testing.T) {
+	frames := [][]string{
+		{"idle"},
+		{"talk1"},
+	}
+
+	rng := rand.New(rand.NewSource(99))
+	for i := 0; i < 100; i++ {
+		got := pickTalkingFrame(frames, rng)
+		if got[0] == "idle" {
+			t.Fatalf("pickTalkingFrame returned idle frame on call %d", i+1)
+		}
+	}
+}
+
+func TestPickTalkingFrame_NoPanicOnTwoFrames(t *testing.T) {
+	// 2-frame input (1 idle + 1 talking) must not panic.
+	frames := [][]string{
+		{"idle"},
+		{"talk"},
+	}
+
+	rng := rand.New(rand.NewSource(7))
+	for i := 0; i < 50; i++ {
+		got := pickTalkingFrame(frames, rng)
+		if got[0] != "talk" {
+			t.Fatalf("pickTalkingFrame with 2 frames returned %q, want talk", got[0])
+		}
 	}
 }

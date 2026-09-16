@@ -9,6 +9,14 @@ import (
 	"github.com/gdamore/tcell/v2"
 )
 
+// pickTalkingFrame returns a random talking frame from frames[1:].
+// frames[0] is the idle frame; talking frames are indices 1..len(frames)-1.
+// Requires len(frames) >= 2.
+func pickTalkingFrame(frames [][]string, rng *rand.Rand) []string {
+	idx := rng.Intn(len(frames)-1) + 1
+	return frames[idx]
+}
+
 func main() {
 	frames, err := LoadFrames()
 	if err != nil {
@@ -74,7 +82,11 @@ func main() {
 		}
 	}()
 
-	// 50ms state-machine tick (FR-028).
+	// 50ms state-machine tick (FR-028) — the loop evaluates voice and
+	// state at 20Hz. Display updates are transition-driven (render-on-
+	// transition, matching the Rust original); SC-009's literal
+	// >=15 display-updates/sec floor is not met during sustained
+	// silence and is tracked separately.
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -114,8 +126,7 @@ func main() {
 			case ActionStartTalking:
 				// Random talking frame chosen once per transition (FR-011);
 				// frames[0] is idle, frames[1:] are the talking frames.
-				idx := rng.Intn(len(frames)-1) + 1
-				avatar.PlayAnimation(term, frames[idx], cfg, rng)
+				avatar.PlayAnimation(term, pickTalkingFrame(frames, rng), cfg, rng)
 			case ActionReturnToIdle:
 				avatar.PlayAnimation(term, frames[0], cfg, rng)
 			}
