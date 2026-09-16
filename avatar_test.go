@@ -23,6 +23,32 @@ func TestNewAvatar_EmptyFrames(t *testing.T) {
 	if err == nil {
 		t.Fatal("NewAvatar() with empty frames should return error")
 	}
+	if err.Error() != "avatar: at least one frame required" {
+		t.Errorf("NewAvatar() error = %q, want %q", err.Error(), "avatar: at least one frame required")
+	}
+}
+
+func TestNewAvatar_SingleFrame(t *testing.T) {
+	avatar, err := NewAvatar([][]string{{"idle"}})
+	if err != nil {
+		t.Fatalf("NewAvatar() with single frame returned error: %v", err)
+	}
+	if got := avatar.Frames(); len(got) != 1 || len(got[0]) != 1 || got[0][0] != "idle" {
+		t.Errorf("Frames() = %v, want [[idle]]", got)
+	}
+}
+
+func TestNewAvatar_EmptyInnerFrame_NoError(t *testing.T) {
+	// The implementation validates only the outer slice: a frame that is an
+	// empty slice is accepted. This pins the current contract so a future
+	// validation change is surfaced by this test.
+	avatar, err := NewAvatar([][]string{{}})
+	if err != nil {
+		t.Fatalf("NewAvatar() with inner empty frame returned error: %v", err)
+	}
+	if got := avatar.Frames(); len(got) != 1 || len(got[0]) != 0 {
+		t.Errorf("Frames() = %v, want one empty frame", got)
+	}
 }
 
 func TestAvatar_CurrentFrame_InitiallyNil(t *testing.T) {
@@ -95,6 +121,120 @@ func TestAvatar_Render_Integration(t *testing.T) {
 				t.Errorf("cell(%d,%d) = %q, want %q after frame switch", x, y, grid[y][x], expected)
 			}
 		}
+	}
+}
+
+func TestAvatar_Render_NilTarget(t *testing.T) {
+	term, sim := newTestTerminal(t, 20, 10)
+	defer term.Close()
+
+	avatar, err := NewAvatar([][]string{{"idle"}})
+	if err != nil {
+		t.Fatalf("NewAvatar() returned error: %v", err)
+	}
+
+	avatar.Render(term, nil)
+	if avatar.CurrentFrame() != nil {
+		t.Errorf("CurrentFrame() = %v, want nil after Render(nil)", avatar.CurrentFrame())
+	}
+
+	// Screen must remain blank: RenderFrame(nil) is a no-op.
+	grid := getScreenContent(t, sim, 20, 10)
+	for y := 0; y < 10; y++ {
+		for x := 0; x < 20; x++ {
+			if grid[y][x] != 0 {
+				t.Errorf("Render(nil) wrote to cell(%d,%d): %q", x, y, grid[y][x])
+			}
+		}
+	}
+}
+
+func TestAvatar_Render_EmptyTarget(t *testing.T) {
+	term, sim := newTestTerminal(t, 20, 10)
+	defer term.Close()
+
+	avatar, err := NewAvatar([][]string{{"idle"}})
+	if err != nil {
+		t.Fatalf("NewAvatar() returned error: %v", err)
+	}
+
+	avatar.Render(term, []string{})
+	if got := avatar.CurrentFrame(); got == nil || len(got) != 0 {
+		t.Errorf("CurrentFrame() = %v, want empty non-nil slice after Render([]string{})", got)
+	}
+
+	// Screen must remain blank: RenderFrame([]string{}) is a no-op.
+	grid := getScreenContent(t, sim, 20, 10)
+	for y := 0; y < 10; y++ {
+		for x := 0; x < 20; x++ {
+			if grid[y][x] != 0 {
+				t.Errorf("Render([]string{}) wrote to cell(%d,%d): %q", x, y, grid[y][x])
+			}
+		}
+	}
+}
+
+func TestAvatar_Render_ArbitraryTarget(t *testing.T) {
+	term, sim := newTestTerminal(t, 20, 10)
+	defer term.Close()
+
+	avatar, err := NewAvatar([][]string{{"idle"}})
+	if err != nil {
+		t.Fatalf("NewAvatar() returned error: %v", err)
+	}
+
+	// Render a frame that was never registered in Frames() — Render accepts
+	// any target slice, not just frames from the avatar's own storage.
+	external := []string{"Z"}
+	avatar.Render(term, external)
+
+	if got := avatar.CurrentFrame(); len(got) != 1 || got[0] != "Z" {
+		t.Errorf("CurrentFrame() = %v, want [Z]", got)
+	}
+
+	grid := getScreenContent(t, sim, 20, 10)
+	if grid[4][9] != 'Z' {
+		t.Errorf("cell(9,4) = %q, want 'Z' after Render of external frame", grid[4][9])
+	}
+}
+
+func TestAvatar_CurrentFrame_ReturnsExactTarget(t *testing.T) {
+	term, _ := newTestTerminal(t, 20, 10)
+	defer term.Close()
+
+	avatar, err := NewAvatar([][]string{{"idle"}})
+	if err != nil {
+		t.Fatalf("NewAvatar() returned error: %v", err)
+	}
+
+	target := []string{"frame"}
+	avatar.Render(term, target)
+
+	// CurrentFrame must return the exact slice passed to Render (identity),
+	// not a copy.
+	got := avatar.CurrentFrame()
+	if got == nil || len(got) != len(target) {
+		t.Fatalf("CurrentFrame() = %v, want the exact target slice", got)
+	}
+	if &got[0] != &target[0] {
+		t.Errorf("CurrentFrame() returned a copy, not the exact target slice")
+	}
+}
+
+func TestAvatar_Frames_ReturnsBackingSlice(t *testing.T) {
+	frames := [][]string{{"idle"}, {"tolk0"}}
+	avatar, err := NewAvatar(frames)
+	if err != nil {
+		t.Fatalf("NewAvatar() returned error: %v", err)
+	}
+
+	got := avatar.Frames()
+	if len(got) != 2 {
+		t.Fatalf("Frames() returned %d frames, want 2", len(got))
+	}
+	// Frames() must return the original backing slice, not a copy.
+	if &got[0] != &frames[0] {
+		t.Errorf("Frames() returned a copy, not the original backing slice")
 	}
 }
 
