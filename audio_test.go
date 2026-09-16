@@ -314,7 +314,10 @@ func TestAudioStopCallback_UnexpectedStopRecordsFailure(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestAudioWatch_StallDetection verifies the watchdog records a failure when
-// started but no Data callback has fired for captureStallTimeout.
+// started but no Data callback has fired for captureStallTimeout. The failure
+// is polled (the watchdog keeps running after recording it — fail() is
+// first-wins), then the watchdog is terminated cleanly by closing stopWatch,
+// mirroring the production Close() path.
 func TestAudioWatch_StallDetection(t *testing.T) {
 	c := &Capture{
 		stopWatch: make(chan struct{}),
@@ -325,18 +328,27 @@ func TestAudioWatch_StallDetection(t *testing.T) {
 
 	go c.watch()
 
-	select {
-	case <-c.watchDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("watch() did not detect stall within 5s")
+	// The watchdog ticker fires every second, so the stale lastData timestamp
+	// trips the stall check on the first tick. Poll failed instead of blocking
+	// on watchDone, which closes only when the watchdog exits.
+	deadline := time.Now().Add(5 * time.Second)
+	for !c.failed.Load() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
 	}
-
 	if !c.failed.Load() {
-		t.Error("watch() did not record failure for stalled stream")
+		t.Fatal("watch() did not record failure for stalled stream")
 	}
 	err := c.Err()
 	if err == nil || err.Error() != "audio capture stopped delivering data" {
 		t.Errorf("Err() = %v, want %q", err, "audio capture stopped delivering data")
+	}
+
+	// Terminate the watchdog goroutine cleanly, mirroring Close().
+	close(c.stopWatch)
+	select {
+	case <-c.watchDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watch() did not exit after stopWatch closed")
 	}
 }
 
