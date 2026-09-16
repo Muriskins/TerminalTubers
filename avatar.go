@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"math/rand"
+)
 
 // Avatar manages frame storage and instant (non-animated) frame switching.
 // Animation transitions (Scramble, Collapse, Reveal, Smart) will be added
@@ -38,4 +41,17 @@ func (a *Avatar) CurrentFrame() []string {
 // Convention: frames[0] = idle, frames[1:] = talking frames.
 func (a *Avatar) Frames() [][]string {
 	return a.frames
+}
+
+// PlayAnimation switches to target, animating the transition when animations
+// are enabled and a current frame exists. When animations are disabled or no
+// frame has been rendered yet, the switch is instant (FR-013). After either
+// path the target becomes the current frame.
+func (a *Avatar) PlayAnimation(term *Terminal, target []string, cfg Config, rng *rand.Rand) {
+	if cfg.AnimationsEnabled && a.current != nil {
+		AnimateTransition(term, a.current, target, cfg, rng)
+	} else {
+		term.RenderFrame(target)
+	}
+	a.current = target
 }
