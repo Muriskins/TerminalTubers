@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 )
@@ -54,28 +56,68 @@ func main() {
 	// Render the idle frame once to start.
 	avatar.Render(term, frames[0])
 
-	// Event loop: wait for q/Q to quit, or resize to re-render.
-	for {
-		ev := term.PollEvent()
-		switch e := ev.(type) {
-		case *tcell.EventKey:
-			switch {
-			case e.Key() == tcell.KeyEscape, e.Rune() == 'q' || e.Rune() == 'Q':
+	cfg := DefaultConfig()
+	sm := NewStateMachine(time.Duration(cfg.IdleDelayMs)*time.Millisecond, 3)
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	// PollEvent blocks, so drain it in a goroutine into a buffered channel.
+	// The goroutine exits when PollEvent returns nil, which happens once the
+	// terminal is closed (deferred Close on return).
+	eventCh := make(chan tcell.Event, 8)
+	go func() {
+		for {
+			ev := term.PollEvent()
+			if ev == nil {
 				return
 			}
-		case *tcell.EventResize:
-			term.screen.Sync()
-			term.RenderFrame(avatar.CurrentFrame())
+			eventCh <- ev
 		}
+	}()
 
-		// Surface mid-session capture failures (FR-026): return to the idle
-		// avatar and print a notice. The idle frame is already on screen, so
-		// no re-render is needed here - the state machine (task 4.1) will
-		// handle transitions.
-		if capture != nil && !captureFailureSurfaced {
-			if err := capture.Err(); err != nil {
-				fmt.Fprintf(os.Stderr, "TerminalTubers: audio capture failed: %v\n", err)
-				captureFailureSurfaced = true
+	// 50ms state-machine tick (FR-028).
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case ev := <-eventCh:
+			switch e := ev.(type) {
+			case *tcell.EventKey:
+				switch {
+				case e.Key() == tcell.KeyEscape, e.Rune() == 'q' || e.Rune() == 'Q':
+					return
+				case e.Rune() == 's' || e.Rune() == 'S':
+					// Settings menu is owned by Phase 5; the key binding is
+					// reserved here so it is recognized but intentionally a
+					// no-op until the menu lands.
+				}
+			case *tcell.EventResize:
+				term.Sync()
+				term.RenderFrame(avatar.CurrentFrame())
+			}
+		case <-ticker.C:
+			// Surface mid-session capture failures once (FR-026). A failed
+			// capture reports RMS 0.0, which the state machine treats as "no
+			// voice" — the avatar naturally returns to idle, so no extra
+			// failure logic is needed here.
+			if capture != nil && !captureFailureSurfaced {
+				if err := capture.Err(); err != nil {
+					fmt.Fprintf(os.Stderr, "TerminalTubers: audio capture failed: %v\n", err)
+					captureFailureSurfaced = true
+				}
+			}
+
+			// RMS() returns float32 while Threshold is float64 — the explicit
+			// cast is required for the strict > comparison.
+			voice := capture != nil && capture.RMS() > float32(cfg.Threshold)
+			switch sm.Tick(voice, time.Now()) {
+			case ActionStartTalking:
+				// Random talking frame chosen once per transition (FR-011);
+				// frames[0] is idle, frames[1:] are the talking frames.
+				idx := rng.Intn(len(frames)-1) + 1
+				avatar.PlayAnimation(term, frames[idx], cfg, rng)
+			case ActionReturnToIdle:
+				avatar.PlayAnimation(term, frames[0], cfg, rng)
 			}
 		}
 	}

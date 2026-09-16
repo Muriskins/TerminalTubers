@@ -103,3 +103,10 @@ func (t *Terminal) RenderFrame(frame []string) {
 func (t *Terminal) PollEvent() tcell.Event {
 	return t.screen.PollEvent()
 }
+
+// Sync redraws the physical screen from the backing buffer and re-queries
+// the terminal size. Call after a resize event so the next render uses the
+// updated dimensions.
+func (t *Terminal) Sync() {
+	t.screen.Sync()
+}
