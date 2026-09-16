@@ -3,8 +3,13 @@ package main
 import (
 	"encoding/binary"
 	"math"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
+	"unsafe"
+
+	"github.com/gen2brain/malgo"
 )
 
 // ---------------------------------------------------------------------------
@@ -395,4 +400,511 @@ func TestNewCapture_GracefulDegradation(t *testing.T) {
 	}
 	c.Close()
 	c.Close() // idempotent
+}
+
+// ---------------------------------------------------------------------------
+// FR-020: device enumeration / selection (Devices, SelectedDeviceID,
+// SelectDevice)
+// ---------------------------------------------------------------------------
+
+// waitForData polls lastData until it advances past `after` or the timeout
+// elapses. Returns true when Data callbacks were observed (i.e. the capture
+// stream is delivering).
+func waitForData(t *testing.T, c *Capture, after int64, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if c.lastData.Load() > after {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
+}
+
+// TestDevices_AfterCloseReturnsEmptyNonNil verifies Devices() on a Capture
+// whose context is nil (zero value — the exact post-Close state) returns an
+// empty NON-NIL slice without panicking.
+func TestDevices_AfterCloseReturnsEmptyNonNil(t *testing.T) {
+	c := &Capture{}
+	c.Close() // idempotent no-op on a zero-value capture
+	devices := c.Devices()
+	if devices == nil {
+		t.Fatal("Devices() returned nil slice, want empty non-nil")
+	}
+	if len(devices) != 0 {
+		t.Errorf("Devices() returned %d devices, want 0", len(devices))
+	}
+}
+
+// TestSelectedDeviceID_DefaultNil verifies a fresh Capture reports automatic
+// (nil) selection.
+func TestSelectedDeviceID_DefaultNil(t *testing.T) {
+	c := &Capture{}
+	if got := c.SelectedDeviceID(); got != nil {
+		t.Errorf("SelectedDeviceID() = %v, want nil (automatic)", got)
+	}
+}
+
+// TestSelectDevice_AfterCloseReturnsError verifies SelectDevice on a closed
+// capture returns "capture closed" for both nil and non-nil device IDs.
+func TestSelectDevice_AfterCloseReturnsError(t *testing.T) {
+	c := &Capture{} // ctx == nil, same state as after Close()
+	err := c.SelectDevice(nil)
+	if err == nil || err.Error() != "capture closed" {
+		t.Errorf("SelectDevice(nil) error = %v, want %q", err, "capture closed")
+	}
+	id := malgo.DeviceID{1, 2, 3}
+	err = c.SelectDevice(&id)
+	if err == nil || err.Error() != "capture closed" {
+		t.Errorf("SelectDevice(id) error = %v, want %q", err, "capture closed")
+	}
+}
+
+// TestDevices_LiveCaptureEnumeratesDevices exercises the real malgo
+// enumeration path: an available capture must enumerate at least one named
+// device and exactly one default device. After Close() the slice must be empty
+// and non-nil. Hardware-dependent — skipped when no audio backend or capture
+// device is present.
+func TestDevices_LiveCaptureEnumeratesDevices(t *testing.T) {
+	c, err := NewCapture()
+	if err != nil {
+		t.Skipf("audio backend unavailable: %v", err)
+	}
+	defer c.Close()
+	if !c.Available() {
+		t.Skip("no capture device available")
+	}
+	devices := c.Devices()
+	if devices == nil {
+		t.Fatal("Devices() returned nil slice, want non-nil")
+	}
+	if len(devices) == 0 {
+		t.Fatal("Devices() returned 0 devices on an available capture")
+	}
+	defaults := 0
+	for i, d := range devices {
+		if d.Name == "" {
+			t.Errorf("Devices()[%d].Name is empty", i)
+		}
+		if d.IsDefault {
+			defaults++
+		}
+	}
+	if defaults == 0 {
+		t.Error("no device flagged IsDefault, want exactly one default device")
+	}
+	if defaults > 1 {
+		t.Errorf("%d devices flagged IsDefault, want exactly one", defaults)
+	}
+	// After Close() the context is gone: enumeration must degrade to an empty
+	// non-nil slice.
+	c.Close()
+	devices = c.Devices()
+	if devices == nil {
+		t.Fatal("Devices() after Close() returned nil slice, want empty non-nil")
+	}
+	if len(devices) != 0 {
+		t.Errorf("Devices() after Close() returned %d devices, want 0", len(devices))
+	}
+}
+
+// TestSelectDevice_NilKeepsAutomaticAndDeliversRMS verifies SelectDevice(nil)
+// on a running capture succeeds, leaves the selection automatic (nil), and the
+// capture keeps delivering data (RMS resumes) on the restarted device.
+func TestSelectDevice_NilKeepsAutomaticAndDeliversRMS(t *testing.T) {
+	c, err := NewCapture()
+	if err != nil {
+		t.Skipf("audio backend unavailable: %v", err)
+	}
+	defer c.Close()
+	if !c.Available() {
+		t.Skip("no capture device available")
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	start := c.lastData.Load()
+	if !waitForData(t, c, start, 3*time.Second) {
+		t.Fatal("no data callbacks after Start()")
+	}
+	if got := c.SelectedDeviceID(); got != nil {
+		t.Fatalf("SelectedDeviceID() = %v before any selection, want nil", got)
+	}
+	if err := c.SelectDevice(nil); err != nil {
+		t.Fatalf("SelectDevice(nil) failed: %v", err)
+	}
+	if got := c.SelectedDeviceID(); got != nil {
+		t.Errorf("SelectedDeviceID() = %v after SelectDevice(nil), want nil", got)
+	}
+	if !c.started.Load() {
+		t.Error("started = false after SelectDevice(nil) on running capture, want true")
+	}
+	before := c.lastData.Load()
+	if !waitForData(t, c, before, 3*time.Second) {
+		t.Fatal("no data callbacks after SelectDevice(nil) — capture did not restart")
+	}
+	rms := c.RMS()
+	if math.IsNaN(float64(rms)) || rms < 0 {
+		t.Errorf("RMS() = %v after switch, want valid non-negative level", rms)
+	}
+	t.Logf("RMS after SelectDevice(nil): %v", rms)
+}
+
+// TestSelectDevice_WithDeviceIDSwitchesAndRestarts verifies selecting a real
+// enumerated device: the selection is stored as a COPY equal to the requested
+// ID, the capture restarts and keeps delivering data, and switching back to
+// nil clears the selection.
+func TestSelectDevice_WithDeviceIDSwitchesAndRestarts(t *testing.T) {
+	c, err := NewCapture()
+	if err != nil {
+		t.Skipf("audio backend unavailable: %v", err)
+	}
+	defer c.Close()
+	if !c.Available() {
+		t.Skip("no capture device available")
+	}
+	devices := c.Devices()
+	if len(devices) == 0 {
+		t.Skip("no capture devices enumerated")
+	}
+	target := devices[0]
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	start := c.lastData.Load()
+	if !waitForData(t, c, start, 3*time.Second) {
+		t.Fatal("no data callbacks after Start()")
+	}
+	if err := c.SelectDevice(&target.ID); err != nil {
+		t.Fatalf("SelectDevice(%v) failed: %v", target.ID, err)
+	}
+	got := c.SelectedDeviceID()
+	if got == nil {
+		t.Fatal("SelectedDeviceID() = nil after selecting a device, want non-nil")
+	}
+	if *got != target.ID {
+		t.Errorf("SelectedDeviceID() = %v, want %v (byte-for-byte)", *got, target.ID)
+	}
+	if got == &target.ID {
+		t.Error("SelectedDeviceID() returned the caller's pointer, want a stored copy")
+	}
+	if !c.started.Load() {
+		t.Error("started = false after SelectDevice on running capture, want true")
+	}
+	before := c.lastData.Load()
+	if !waitForData(t, c, before, 3*time.Second) {
+		t.Fatal("no data callbacks after device switch — capture did not restart")
+	}
+	// Switching back to automatic must clear the stored selection.
+	if err := c.SelectDevice(nil); err != nil {
+		t.Fatalf("SelectDevice(nil) after device switch failed: %v", err)
+	}
+	if got := c.SelectedDeviceID(); got != nil {
+		t.Errorf("SelectedDeviceID() = %v after SelectDevice(nil), want nil", got)
+	}
+}
+
+// TestSelectDevice_PreservesStartedState verifies the started/stopped state is
+// preserved across a device switch: a stopped capture stays stopped (no data
+// flows), a running capture restarts and delivers data.
+func TestSelectDevice_PreservesStartedState(t *testing.T) {
+	c, err := NewCapture()
+	if err != nil {
+		t.Skipf("audio backend unavailable: %v", err)
+	}
+	defer c.Close()
+	if !c.Available() {
+		t.Skip("no capture device available")
+	}
+
+	// Stopped capture: switch must leave it stopped with no data flowing.
+	if err := c.SelectDevice(nil); err != nil {
+		t.Fatalf("SelectDevice(nil) on stopped capture failed: %v", err)
+	}
+	if c.started.Load() {
+		t.Error("started = true after SelectDevice on stopped capture, want false")
+	}
+	if got := c.lastData.Load(); got != 0 {
+		t.Errorf("lastData = %d after switch on stopped capture, want 0 (no data)", got)
+	}
+
+	// Running capture: switch must restart it and keep delivering data.
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	start := c.lastData.Load()
+	if !waitForData(t, c, start, 3*time.Second) {
+		t.Fatal("no data callbacks after Start()")
+	}
+	if err := c.SelectDevice(nil); err != nil {
+		t.Fatalf("SelectDevice(nil) on running capture failed: %v", err)
+	}
+	if !c.started.Load() {
+		t.Error("started = false after SelectDevice on running capture, want true (restarted)")
+	}
+	before := c.lastData.Load()
+	if !waitForData(t, c, before, 3*time.Second) {
+		t.Fatal("no data callbacks after restart")
+	}
+}
+
+// TestSelectDevice_RecoversFromWatchdogStall verifies the watchdog keeps
+// running after recording a stall failure (fail() is first-wins) and that a
+// subsequent SelectDevice(nil) clears the failure and restarts capture. The
+// stall is simulated by marking the capture started with a stale lastData
+// timestamp while the device is not actually running, so the real watchdog
+// goroutine (started by NewCapture) records the failure. Hardware-dependent;
+// takes ~1-3s.
+func TestSelectDevice_RecoversFromWatchdogStall(t *testing.T) {
+	c, err := NewCapture()
+	if err != nil {
+		t.Skipf("audio backend unavailable: %v", err)
+	}
+	defer c.Close()
+	if !c.Available() {
+		t.Skip("no capture device available")
+	}
+
+	// Simulate a stalled stream: started with no data for > captureStallTimeout.
+	c.started.Store(true)
+	c.lastData.Store(time.Now().Add(-10 * time.Second).UnixNano())
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !c.failed.Load() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !c.failed.Load() {
+		t.Fatal("watchdog did not record the stall failure")
+	}
+	if err := c.Err(); err == nil || err.Error() != "audio capture stopped delivering data" {
+		t.Fatalf("Err() = %v, want %q", err, "audio capture stopped delivering data")
+	}
+
+	// SelectDevice(nil) must clear the failure and restart capture (wasStarted
+	// is true, so Start() runs inside SelectDevice).
+	if err := c.SelectDevice(nil); err != nil {
+		t.Fatalf("SelectDevice(nil) after stall failed: %v", err)
+	}
+	if err := c.Err(); err != nil {
+		t.Errorf("Err() = %v after SelectDevice, want nil (failure cleared)", err)
+	}
+	if !c.started.Load() {
+		t.Error("started = false after SelectDevice, want true (restarted)")
+	}
+	before := c.lastData.Load()
+	if !waitForData(t, c, before, 3*time.Second) {
+		t.Fatal("no data callbacks after recovery — capture did not resume")
+	}
+	rms := c.RMS()
+	if math.IsNaN(float64(rms)) || rms < 0 {
+		t.Errorf("RMS() = %v after recovery, want valid non-negative level", rms)
+	}
+	t.Logf("RMS after recovery: %v", rms)
+}
+
+// ---------------------------------------------------------------------------
+// SelectDevice fallback: graceful degradation when the requested device is
+// gone (FR-025/026). The fallback path (audio.go lines 264-268) retries
+// InitDevice once with the default device when the requested ID fails, and
+// keeps reporting the requested ID via SelectedDeviceID() — the fallback is
+// transparent to the caller.
+// ---------------------------------------------------------------------------
+
+// bogusDeviceID returns a well-formed but nonexistent capture device ID: the
+// WASAPI endpoint string is a single non-character (U+FFFF) followed by a null
+// terminator. Unlike a raw 0xFF-filled buffer, this is null-terminated, so
+// IMMDeviceEnumerator::GetDevice fails cleanly with E_NOTFOUND instead of
+// scanning past the buffer for a terminator. No real device can match it, so
+// malgo.InitDevice must fail for it and SelectDevice must take the fallback.
+// (On non-WASAPI Windows backends the bytes are likewise a fixed-size ID —
+// GUID or UINT — that matches no device.)
+func bogusDeviceID() malgo.DeviceID {
+	var id malgo.DeviceID
+	id[0] = 0xFF
+	id[1] = 0xFF
+	id[2] = 0x00
+	id[3] = 0x00
+	return id
+}
+
+// TestSelectDevice_FallbackToDefaultWhenDeviceGone exercises the graceful
+// degradation path of SelectDevice: when the requested device ID cannot be
+// opened (stale/invalid — here a nonexistent ID), SelectDevice retries once
+// with the default device. The fallback is transparent: on success the capture
+// is available, no failure is recorded, and SelectedDeviceID() still reports
+// the requested ID. If the default device also cannot be opened, SelectDevice
+// must return the wrapped InitDevice error and record the failure via Err().
+// Any panic in the fallback path fails the test. Hardware-dependent —
+// self-skips when no capture device is present.
+func TestSelectDevice_FallbackToDefaultWhenDeviceGone(t *testing.T) {
+	c, err := NewCapture()
+	if err != nil {
+		t.Skipf("audio backend unavailable: %v", err)
+	}
+	defer c.Close()
+	if !c.Available() {
+		t.Skip("no capture device available")
+	}
+	if len(c.Devices()) == 0 {
+		t.Skip("no capture devices enumerated")
+	}
+
+	bogus := bogusDeviceID()
+	err = c.SelectDevice(&bogus)
+	if err != nil {
+		// Only acceptable when the default device cannot be opened either:
+		// the error must be the wrapped InitDevice error and the failure must
+		// be recorded for Err().
+		if !strings.Contains(err.Error(), "initialize audio capture device") {
+			t.Errorf("SelectDevice(bogus) error = %v, want wrapped %q", err, "initialize audio capture device")
+		}
+		if c.Available() {
+			t.Error("Available() = true after total SelectDevice failure, want false")
+		}
+		if c.Err() == nil {
+			t.Error("Err() = nil after total SelectDevice failure, want recorded failure")
+		}
+		return
+	}
+
+	// Fallback succeeded on the default device: the capture must be available,
+	// healthy, and still report the requested (bogus) ID.
+	if !c.Available() {
+		t.Error("Available() = false after fallback, want true")
+	}
+	if got := c.Err(); got != nil {
+		t.Errorf("Err() = %v after fallback, want nil (failure state reset)", got)
+	}
+	got := c.SelectedDeviceID()
+	if got == nil {
+		t.Fatal("SelectedDeviceID() = nil after fallback, want the requested ID (transparent fallback)")
+	}
+	if *got != bogus {
+		t.Errorf("SelectedDeviceID() = %v, want requested bogus ID %v", *got, bogus)
+	}
+	if got == &bogus {
+		t.Error("SelectedDeviceID() returned the caller's pointer, want a stored copy")
+	}
+}
+
+// TestSelectDevice_FallbackPreservesAutomaticSelection documents the
+// transparent-fallback contract on a RUNNING capture: when the requested
+// device is gone, SelectDevice falls back to the default device but the
+// reported selection stays the requested ID (never nil) — the caller asked for
+// that device, so SelectedDeviceID() returns it. The capture must restart
+// (wasStarted) and keep delivering data on the fallback device, proving the
+// fallback opened a real device. Hardware-dependent — self-skips when no
+// capture device is present.
+func TestSelectDevice_FallbackPreservesAutomaticSelection(t *testing.T) {
+	c, err := NewCapture()
+	if err != nil {
+		t.Skipf("audio backend unavailable: %v", err)
+	}
+	defer c.Close()
+	if !c.Available() {
+		t.Skip("no capture device available")
+	}
+	if len(c.Devices()) == 0 {
+		t.Skip("no capture devices enumerated")
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	start := c.lastData.Load()
+	if !waitForData(t, c, start, 3*time.Second) {
+		t.Fatal("no data callbacks after Start()")
+	}
+
+	bogus := bogusDeviceID()
+	if err := c.SelectDevice(&bogus); err != nil {
+		t.Fatalf("SelectDevice(bogus) fallback failed: %v", err)
+	}
+
+	// The fallback is transparent: the selection reports the requested ID,
+	// never nil, even though the physical device is the default.
+	got := c.SelectedDeviceID()
+	if got == nil {
+		t.Fatal("SelectedDeviceID() = nil after fallback, want the requested ID (transparent fallback)")
+	}
+	if *got != bogus {
+		t.Errorf("SelectedDeviceID() = %v, want requested bogus ID %v", *got, bogus)
+	}
+	if got == &bogus {
+		t.Error("SelectedDeviceID() returned the caller's pointer, want a stored copy")
+	}
+	// The running capture must have restarted on the fallback device.
+	if !c.started.Load() {
+		t.Error("started = false after fallback on running capture, want true (restarted)")
+	}
+	before := c.lastData.Load()
+	if !waitForData(t, c, before, 3*time.Second) {
+		t.Fatal("no data callbacks after fallback — capture did not restart on the default device")
+	}
+	if err := c.Err(); err != nil {
+		t.Errorf("Err() = %v after fallback, want nil (failure state reset)", err)
+	}
+}
+
+// TestSelectDevice_InitDeviceFailureWithNonexistentID verifies the mechanism
+// behind the fallback: malgo.InitDevice must FAIL for a nonexistent DeviceID,
+// and SelectDevice must then succeed by retrying with the default device. The
+// premise is checked directly with a probe InitDevice call (replicating the
+// pinned-copy pattern from SelectDevice); if a backend ever accepted the bogus
+// ID, the test self-skips because the fallback cannot be exercised. Data must
+// flow after the switch, proving the fallback opened the real default device.
+// Hardware-dependent — self-skips when no capture device is present.
+func TestSelectDevice_InitDeviceFailureWithNonexistentID(t *testing.T) {
+	c, err := NewCapture()
+	if err != nil {
+		t.Skipf("audio backend unavailable: %v", err)
+	}
+	defer c.Close()
+	if !c.Available() {
+		t.Skip("no capture device available")
+	}
+	if len(c.Devices()) == 0 {
+		t.Skip("no capture devices enumerated")
+	}
+
+	bogus := bogusDeviceID()
+
+	// Premise: InitDevice with the bogus ID must fail. Replicate the pinned
+	// copy pattern from SelectDevice so the cgo pointer checker accepts it.
+	cfg := malgo.DefaultDeviceConfig(malgo.Capture)
+	cfg.Capture.Format = malgo.FormatF32
+	cfg.Capture.Channels = captureChannels
+	cfg.SampleRate = captureSampleRate
+	cfg.PeriodSizeInMilliseconds = capturePeriodMs
+	idCopy := bogus
+	var pinner runtime.Pinner
+	pinner.Pin(&idCopy)
+	defer pinner.Unpin()
+	cfg.Capture.DeviceID = unsafe.Pointer(&idCopy)
+	probe, probeErr := malgo.InitDevice(c.ctx.Context, cfg, malgo.DeviceCallbacks{})
+	if probeErr == nil {
+		probe.Uninit()
+		t.Skip("backend accepted bogus device ID — fallback path cannot be exercised")
+	}
+
+	// With the premise confirmed, SelectDevice must succeed via the fallback.
+	if err := c.SelectDevice(&bogus); err != nil {
+		t.Fatalf("SelectDevice(bogus) fallback failed: %v", err)
+	}
+	if !c.Available() {
+		t.Error("Available() = false after fallback, want true")
+	}
+	got := c.SelectedDeviceID()
+	if got == nil || *got != bogus {
+		t.Errorf("SelectedDeviceID() = %v, want requested bogus ID %v", got, bogus)
+	}
+	// Data must flow: the fallback opened the real default device (the bogus
+	// device cannot deliver audio).
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start() after fallback failed: %v", err)
+	}
+	start := c.lastData.Load()
+	if !waitForData(t, c, start, 3*time.Second) {
+		t.Fatal("no data callbacks after fallback — capture did not open the default device")
+	}
 }

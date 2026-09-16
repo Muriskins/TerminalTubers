@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,10 @@ type Capture struct {
 	device    *malgo.Device
 	available bool
 
+	// selectedID holds the user-selected capture device; nil = automatic
+	// (default device).
+	selectedID *malgo.DeviceID
+
 	// RMS shared with the main loop: atomic uint32 holding float32 bits.
 	rms atomic.Uint32
 
@@ -53,6 +58,13 @@ type Capture struct {
 	stopWatch chan struct{}
 	watchDone chan struct{}
 	closeOnce sync.Once
+}
+
+// DeviceInfo describes a capture device for the settings menu.
+type DeviceInfo struct {
+	Name      string
+	ID        malgo.DeviceID
+	IsDefault bool
 }
 
 // NewCapture initializes the audio context and opens the default capture
@@ -169,6 +181,114 @@ func (c *Capture) Err() error {
 	return errors.New(msg)
 }
 
+// Devices lists the available capture devices. The returned slice is never
+// nil; an empty slice means no capture devices are present (or the context
+// has been closed).
+func (c *Capture) Devices() []DeviceInfo {
+	if c.ctx == nil {
+		return []DeviceInfo{}
+	}
+	infos, err := c.ctx.Devices(malgo.Capture)
+	if err != nil {
+		return []DeviceInfo{}
+	}
+	devices := make([]DeviceInfo, 0, len(infos))
+	for _, d := range infos {
+		devices = append(devices, DeviceInfo{
+			Name:      d.Name(),
+			ID:        d.ID,
+			IsDefault: d.IsDefault != 0,
+		})
+	}
+	return devices
+}
+
+// SelectedDeviceID returns the currently selected capture device ID, or nil
+// when capture uses the automatic (default) device. The settings menu uses
+// this to highlight the current selection.
+func (c *Capture) SelectedDeviceID() *malgo.DeviceID {
+	if c.selectedID == nil {
+		return nil
+	}
+	sel := *c.selectedID
+	return &sel
+}
+
+// SelectDevice switches capture to the given device (nil = automatic/default
+// device). The device is re-initialized and, if capture was running, restarted
+// on the new device. If the selected device cannot be opened, capture falls
+// back to the default device; if that also fails, capture is left unavailable
+// and the failure is recorded for Err().
+func (c *Capture) SelectDevice(id *malgo.DeviceID) error {
+	if c.ctx == nil {
+		return errors.New("capture closed")
+	}
+
+	wasStarted := c.started.Load()
+
+	// Pause the watchdog and suppress the stop callback while the device is
+	// swapped so the uninit does not record a spurious failure.
+	c.started.Store(false)
+	c.stopping.Store(true)
+	if c.device != nil {
+		c.device.Uninit()
+		c.device = nil
+	}
+	c.stopping.Store(false)
+	c.available = false
+
+	cfg := malgo.DefaultDeviceConfig(malgo.Capture)
+	cfg.Capture.Format = malgo.FormatF32
+	cfg.Capture.Channels = captureChannels
+	cfg.SampleRate = captureSampleRate
+	cfg.PeriodSizeInMilliseconds = capturePeriodMs
+	if id != nil {
+		// Copy the ID into a standalone local so the cgo pointer checker
+		// accepts it: a pointer into the caller's DeviceInfo struct would
+		// carry the struct's Go pointers (Name string header) across the
+		// cgo boundary. The copy must also be pinned: Go 1.21+ checkptr
+		// requires any Go pointer nested inside a cgo argument (here the
+		// pDeviceID field of the C config struct) to point to pinned
+		// memory, and the copy escapes to the heap. malgo copies the ID
+		// bytes during InitDevice, so the pinned local only needs to
+		// outlive this call.
+		idCopy := *id
+		var pinner runtime.Pinner
+		pinner.Pin(&idCopy)
+		defer pinner.Unpin()
+		cfg.Capture.DeviceID = unsafe.Pointer(&idCopy)
+	}
+
+	callbacks := malgo.DeviceCallbacks{Data: c.dataCallback, Stop: c.stopCallback}
+	device, err := malgo.InitDevice(c.ctx.Context, cfg, callbacks)
+	if err != nil && id != nil {
+		// The selected device is gone or unusable — fall back to the default.
+		cfg.Capture.DeviceID = nil
+		device, err = malgo.InitDevice(c.ctx.Context, cfg, callbacks)
+	}
+	if err != nil {
+		c.fail(fmt.Sprintf("audio capture device unavailable: %v", err))
+		return fmt.Errorf("initialize audio capture device: %w", err)
+	}
+
+	c.device = device
+	c.available = true
+	if id != nil {
+		sel := *id
+		c.selectedID = &sel
+	} else {
+		c.selectedID = nil
+	}
+	// Reset the failure state so future failures are detected again.
+	c.failed.Store(false)
+	c.errMsg.Store("")
+
+	if wasStarted {
+		return c.Start()
+	}
+	return nil
+}
+
 // dataCallback runs on the malgo audio thread. It accumulates squared samples
 // and emits an RMS value every captureWindowFrames frames (100ms). It must
 // stay allocation-free and lock-free.
@@ -224,8 +344,11 @@ func (c *Capture) watch() {
 			}
 			last := time.Unix(0, c.lastData.Load())
 			if time.Since(last) > captureStallTimeout {
+				// fail() is first-wins, so a stall is recorded once. The
+				// watchdog keeps running: after SelectDevice restarts the
+				// device, Start() refreshes lastData and stall detection
+				// resumes on this same goroutine.
 				c.fail("audio capture stopped delivering data")
-				return
 			}
 		}
 	}
