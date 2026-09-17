@@ -102,7 +102,7 @@ go run .
 # Сборка
 go build -o TerminalTubers .
 
-# Тесты (159 тестов)
+# Тесты (162 теста)
 go test ./...
 ```
 

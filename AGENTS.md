@@ -33,7 +33,7 @@ Go appends `-mthreads` to the compiler line for windows cgo builds; clang (MSVC 
 - Animation tests (`animation_test.go`, 76 tests) drive `AnimateTransition` and the Smart helpers on `tcell.NewSimulationScreen` — 100% coverage of `animation.go`.
 - `TestNewCapture_GracefulDegradation` exercises real malgo init and may hang in sandboxes without an audio backend — run it separately with a short `-timeout` if it hangs.
 - Audio tests drive the production `dataCallback` with synthetic little-endian float32 buffers.
-- State-machine tests (`state_machine_test.go`, 18 tests) drive `Tick` with synthetic voice/time sequences — 100% branch coverage of `state_machine.go`.
+- State-machine tests (`state_machine_test.go`, 21 tests) drive `Tick` with synthetic voice/time sequences — 100% branch coverage of `state_machine.go`.
 
 ## Frames (go:embed)
 
