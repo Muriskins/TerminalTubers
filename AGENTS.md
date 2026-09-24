@@ -34,6 +34,7 @@ Go appends `-mthreads` to the compiler line for windows cgo builds; clang (MSVC 
 - `TestNewCapture_GracefulDegradation` exercises real malgo init and may hang in sandboxes without an audio backend — run it separately with a short `-timeout` if it hangs.
 - Audio tests drive the production `dataCallback` with synthetic little-endian float32 buffers.
 - State-machine tests (`state_machine_test.go`, 21 tests) drive `Tick` with synthetic voice/time sequences — 100% branch coverage of `state_machine.go`.
+- The `pickTalkingFrame` helper (main.go:12-18) is covered by `TestPickTalkingFrame_*` tests (3 tests in `state_machine_test.go`).
 
 ## Frames (go:embed)
 
@@ -48,3 +49,15 @@ Four ASCII frames are embedded: `ascii_art/idle.txt` + `tolk0/1/2.txt`. Adding a
 - Build artifacts: `TerminalTubers.exe` is gitignored; `clang-wrap.exe` and `cover` are not (known repo-hygiene issue).
 - Commit policy: commit AND push after each completed task (user decision).
 - Windows-only: GOOS=windows, CGO_ENABLED=1. Linux is a separate future effort on a separate branch.
+- Phase 5 settings menu integration points (verified 2026-09-24):
+  - 's'/'S' key case at main.go:101-105 is an empty reserved no-op — the menu hooks here.
+  - Esc/q/Q quit unconditionally at main.go:99 — the menu MUST intercept Esc before it reaches the quit case.
+  - eventCh (main.go:74-83) hardwires ALL events (keys + resize) from the PollEvent goroutine with no routing hook — the menu must share/restructure this channel.
+  - Config is a local value (main.go:67); menu needs its own working copy + apply-on-return; main.go must reassign cfg for immediate effect.
+  - IdleDelayMs is baked into StateMachine at construction (main.go:68) — NOT a menu item (spec Assumption 2), so no re-wiring needed for the menu.
+  - Config.AudioDevice (config.go:49,64) is declared/defaulted but NEVER read — Phase 5.2 must wire it to capture.SelectDevice (audio.go:222).
+  - captureFailureSurfaced (main.go:41) is never reset — device switch in Phase 5 must reset it or FR-026 surfacing breaks after recovery.
+  - Terminal.Size() (terminal.go:43-45) has no production caller — ready for menu layout use.
+  - Avatar.Frames() (avatar.go:42-44) has no production caller; main.go indexes a local `frames` slice — two sources of truth, pick one when touching frame code.
+  - Audio device API is ready: Devices() []DeviceInfo (audio.go:187), SelectDevice(id *malgo.DeviceID) (audio.go:222, nil = automatic), SelectedDeviceID() (audio.go:209). No current-device-NAME accessor exists — menu must match SelectedDeviceID() against Devices() entries.
+  - SME menu guidance (CONTEXT.md): hand-roll cursorIdx + editing bool (~100 lines), redraw only menu region.
